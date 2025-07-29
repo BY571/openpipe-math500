@@ -1,0 +1,323 @@
+import sqlite3
+import random
+import os
+from typing import List, Optional, Literal
+from dataclasses import dataclass, asdict
+from pydantic import BaseModel, Field
+from textwrap import dedent
+from datasets import load_dataset, Dataset, Features, Value, Sequence
+from tqdm import tqdm
+from datetime import datetime
+import json
+import numpy as np
+import traceback
+import io
+import sys
+import art
+import weave
+from langchain_core.utils.function_calling import convert_to_openai_tool
+from tenacity import retry, stop_after_attempt
+from litellm import acompletion
+from art.utils.litellm import convert_litellm_choice_to_openai
+from art.local import LocalBackend
+
+random.seed(42)
+
+class Scenario(BaseModel):
+    problem: str
+    answer: str
+    unique_id: str
+    split: Literal["train", "test"]
+
+class FinalAnswer(BaseModel):
+    answer: str
+    source_ids: list[str]
+
+
+def return_final_answer(
+    answer: str, reference_message_ids: list[str]
+) -> FinalAnswer:
+    """Return the final answer and the message IDs of the math questions that were used to generate the answer."""
+    return FinalAnswer(answer=answer, source_ids=reference_message_ids)
+
+
+def run_python(code: str) -> str:
+    """
+    Executes a string of Python code safely and returns the output.
+    The code can use numpy, which is imported as np.
+    Raises an exception if the code fails to execute.
+    """
+    allowed_globals = {
+        "__builtins__": __builtins__,
+        "np": np
+    }
+    # Redirect stdout to capture the output
+    old_stdout = sys.stdout
+    redirected_output = io.StringIO()
+    sys.stdout = redirected_output
+
+    try:
+        local_scope = {}
+        exec(code, allowed_globals, local_scope)
+        # Restore stdout
+        sys.stdout = old_stdout
+        return redirected_output.getvalue()
+    except Exception:
+        # Restore stdout in case of an error
+        sys.stdout = old_stdout
+        error_message = f"Error executing Python code:\n{traceback.format_exc()}"
+        raise Exception(error_message)
+
+
+### Define training Scenarios ###
+
+def load_training_scenarios(
+    split: Literal["train", "test"] = "train",
+    limit: Optional[int] = None,
+    max_messages: Optional[int] = 1,
+    shuffle: bool = False,
+    seed: Optional[int] = None,
+) -> List[Scenario]:
+    """Load training scenarios from Hugging Face dataset"""
+    print(f"Loading {split} scenarios from Hugging Face...")
+    if split != "train":
+        raise ValueError(f"Unknown split: {split}, math-500 only has train split")
+    dataset: Dataset = load_dataset("HuggingFaceH4/MATH-500", split="train")
+
+    if max_messages is not None:
+        dataset = dataset.filter(lambda x: len(x["unique_id"]) <= max_messages)
+
+    if shuffle or (seed is not None):
+        if seed is not None:
+            dataset = dataset.shuffle(seed=seed)
+        else:
+            dataset = dataset.shuffle()
+
+    # Convert each row to a Scenario object
+    scenarios = [Scenario(**row, split=split) for row in dataset]
+
+    if max_messages is not None:
+        scenarios = [s for s in scenarios if len(s.unique_id) <= max_messages]
+
+    if shuffle:
+        if seed is not None:
+            rng = random.Random(seed)
+            rng.shuffle(scenarios)
+        else:
+            random.shuffle(scenarios)
+
+    if limit is not None:
+        scenarios = scenarios[:limit]
+
+    print(f"Loaded {len(scenarios)} scenarios.")
+    return scenarios
+
+
+# Load training scenarios
+training_scenarios = load_training_scenarios(
+    split="train", limit=500, max_messages=1, shuffle=True, seed=42
+)
+
+
+
+
+### Creating a Model ####
+
+
+# Declare the model
+model = art.TrainableModel(
+    name="math-500-agent-001",
+    project="math-500-agent",
+    base_model="Qwen/Qwen2.5-1.5B-Instruct",
+)
+
+# To run on a T4, we need to override some config defaults.
+model._internal_config = art.dev.InternalModelConfig(
+    init_args=art.dev.InitArgs(
+        max_seq_length=2048,
+    ),
+    engine_args=art.dev.EngineArgs(
+        enforce_eager=True,
+        gpu_memory_utilization=0.6,
+    ),
+)
+
+# Initialize the server
+backend = LocalBackend(
+    # Normally we don't want to run the server in-process, but for the output
+    # to show up properly on Google Colab we'll enable this.
+    #in_process=True,
+    path="./.art",
+)
+
+# Register the model with the local Backend (sets up logging, inference, and training)
+model.register(backend)
+
+
+### Rollout Definition ###
+
+
+if os.getenv("WANDB_API_KEY", ""):
+    weave.init(model.project, settings={"print_call_link": False})
+
+MAX_TURNS = 10
+
+
+class CorrectnessJudgeResponse(BaseModel):
+    reasoning: str = Field(description="Explanation of the reasoning process.")
+    accept: bool = Field(description="Whether the AI answer should be accepted.")
+
+
+@retry(stop=stop_after_attempt(3))
+async def judge_correctness(
+    scenario: Scenario, answer: str
+) -> CorrectnessJudgeResponse:
+    system_prompt = dedent(
+        """
+        You are given a question, the reference answer (labelled **Reference answer**), and an answer generated by an AI assistant (labelled **AI answer**).
+
+        Your task is to decide whether the AI answer is correct and should be accepted. You should accept the answer if it contains the relevant information from the reference answer. You should not accept the answer if it is missing information relevant to the question, or if it contradicts the reference answer.
+        """
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": (
+                f"Question: {scenario.question}\n"
+                f"Reference answer: {scenario.answer}\n"
+                f"AI answer: {answer}"
+            ),
+        },
+    ]
+
+    response = await acompletion(
+        model="openai/gpt-4o",
+        messages=messages,
+        response_format=CorrectnessJudgeResponse,
+    )
+
+    first_choice = response.choices[0]
+    raw_content = first_choice.message.content or "{}"
+
+    try:
+        return CorrectnessJudgeResponse.model_validate_json(raw_content)
+    except Exception as e:
+        return CorrectnessJudgeResponse(
+            reasoning=f"Parse error: {e}\nRaw: {raw_content}", accept=False
+        )
+
+
+class ProjectTrajectory(art.Trajectory):
+    final_answer: FinalAnswer | None = None
+
+
+class EmailScenario(BaseModel):
+    step: int
+    scenario: Scenario
+
+
+@weave.op
+async def rollout(model: art.Model, email_scenario: EmailScenario) -> ProjectTrajectory:
+    scenario = email_scenario.scenario
+
+    traj = ProjectTrajectory(
+        reward=0.0,
+        messages_and_choices=[],
+        metadata={
+            "scenario_id": scenario.id,
+            "step": email_scenario.step,
+        },
+    )
+
+    system_prompt = dedent(
+        f"""
+        You are an email search agent. You are given a user query and a list of tools you can use to search the user's email. Use the tools to search the user's emails and find the answer to the user's query. You may take up to {MAX_TURNS} turns to find the answer, so if your first search doesn't find the answer, you can try with different keywords.
+
+        User's email address is {scenario.inbox_address}
+        Today's date is {scenario.query_date}
+        """
+    )
+
+    traj.messages_and_choices = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": scenario.question},
+    ]
+
+    def search_inbox(keywords: list[str]) -> list[dict]:
+        """Search the inbox for emails matching the given keywords and return
+        a list of dictionaries so the LLM can easily consume them."""
+        results = search_emails(
+            inbox=scenario.inbox_address,
+            keywords=keywords,
+            sent_before=scenario.query_date,
+        )
+        return [asdict(result) for result in results]
+
+    def return_final_answer(
+        answer: str, reference_message_ids: list[str]
+    ) -> FinalAnswer:
+        """Return the final answer and the message IDs of the emails that were used to generate the answer."""
+        return FinalAnswer(answer=answer, source_ids=reference_message_ids)
+
+    tools = [search_inbox, read_email, return_final_answer]
+    tools_by_name = {t.__name__: t for t in tools}
+    traj.tools = [convert_to_openai_tool(t) for t in tools]
+
+    if model.trainable:
+        litellm_model_name = f"hosted_vllm/{model.name}"
+    else:
+        litellm_model_name = model.name
+
+    for _ in range(MAX_TURNS):
+        response = await acompletion(
+            model=litellm_model_name,
+            base_url=model.inference_base_url,
+            api_key=model.inference_api_key,
+            temperature=1,
+            messages=traj.messages(),
+            caching=False,
+            tools=traj.tools,
+        )
+
+        response_message = response.choices[0].message
+        traj.messages_and_choices.append(
+            convert_litellm_choice_to_openai(response.choices[0])
+        )
+
+        if not response_message.tool_calls:
+            return traj
+
+        try:
+            for tool_call in response_message.tool_calls:
+                tool_name: str = tool_call.function.name
+                if tool_name in tools_by_name:
+                    tool_args = json.loads(tool_call.function.arguments)
+                    tool_to_call = tools_by_name[tool_name]
+                    result = tool_to_call(**tool_args)
+                    traj.messages_and_choices.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_name,
+                            "content": str(result),
+                        }
+                    )
+
+                    if tool_name == "return_final_answer":
+                        traj.final_answer = result
+                        # Score the trajectory
+                        if traj.final_answer:
+                            correctness_judge_response = await judge_correctness(
+                                scenario, traj.final_answer.answer
+                            )
+                            traj.metrics["correct"] = float(
+                                correctness_judge_response.accept
+                            )
+                        return traj
+        except Exception as e:
+            print(f"Error parsing tool calls: {e}")
+            return traj
+
+    return traj
