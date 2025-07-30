@@ -13,6 +13,7 @@ import numpy as np
 import traceback
 import io
 import sys
+import asyncio
 import art
 import weave
 from langchain_core.utils.function_calling import convert_to_openai_tool
@@ -20,6 +21,8 @@ from tenacity import retry, stop_after_attempt
 from litellm import acompletion
 from art.utils.litellm import convert_litellm_choice_to_openai
 from art.local import LocalBackend
+# Training configuration
+from art.utils import iterate_dataset
 
 random.seed(42)
 
@@ -72,20 +75,16 @@ def run_python(code: str) -> str:
 ### Define training Scenarios ###
 
 def load_training_scenarios(
-    split: Literal["train", "test"] = "train",
+    split: Literal["train", "test"] = "test",
     limit: Optional[int] = None,
-    max_messages: Optional[int] = 1,
     shuffle: bool = False,
     seed: Optional[int] = None,
 ) -> List[Scenario]:
     """Load training scenarios from Hugging Face dataset"""
     print(f"Loading {split} scenarios from Hugging Face...")
-    if split != "train":
-        raise ValueError(f"Unknown split: {split}, math-500 only has train split")
-    dataset: Dataset = load_dataset("HuggingFaceH4/MATH-500", split="train")
-
-    if max_messages is not None:
-        dataset = dataset.filter(lambda x: len(x["unique_id"]) <= max_messages)
+    if split != "test":
+        raise ValueError(f"Unknown split: {split}, math-500 only has test split")
+    dataset: Dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
 
     if shuffle or (seed is not None):
         if seed is not None:
@@ -95,9 +94,6 @@ def load_training_scenarios(
 
     # Convert each row to a Scenario object
     scenarios = [Scenario(**row, split=split) for row in dataset]
-
-    if max_messages is not None:
-        scenarios = [s for s in scenarios if len(s.unique_id) <= max_messages]
 
     if shuffle:
         if seed is not None:
@@ -115,53 +111,10 @@ def load_training_scenarios(
 
 # Load training scenarios
 training_scenarios = load_training_scenarios(
-    split="train", limit=500, max_messages=1, shuffle=True, seed=42
+    split="test", limit=500, shuffle=True, seed=42
 )
-
-
-
-
-### Creating a Model ####
-
-
-# Declare the model
-model = art.TrainableModel(
-    name="math-500-agent-001",
-    project="math-500-agent",
-    base_model="Qwen/Qwen2.5-1.5B-Instruct",
-)
-
-# To run on a T4, we need to override some config defaults.
-model._internal_config = art.dev.InternalModelConfig(
-    init_args=art.dev.InitArgs(
-        max_seq_length=2048,
-    ),
-    engine_args=art.dev.EngineArgs(
-        enforce_eager=True,
-        gpu_memory_utilization=0.6,
-    ),
-)
-
-# Initialize the server
-backend = LocalBackend(
-    # Normally we don't want to run the server in-process, but for the output
-    # to show up properly on Google Colab we'll enable this.
-    #in_process=True,
-    path="./.art",
-)
-
-# Register the model with the local Backend (sets up logging, inference, and training)
-model.register(backend)
-
-
-### Rollout Definition ###
-
-
-if os.getenv("WANDB_API_KEY", ""):
-    weave.init(model.project, settings={"print_call_link": False})
 
 MAX_TURNS = 10
-
 
 class CorrectnessJudgeResponse(BaseModel):
     reasoning: str = Field(description="Explanation of the reasoning process.")
@@ -321,3 +274,111 @@ async def rollout(model: art.Model, email_scenario: EmailScenario) -> ProjectTra
             return traj
 
     return traj
+
+async def main():
+    ### Creating a Model ####
+
+
+    # Declare the model
+    model = art.TrainableModel(
+        name="math-500-agent-001",
+        project="math-500-agent",
+        base_model="Qwen/Qwen2.5-1.5B-Instruct",
+    )
+
+    # To run on a T4, we need to override some config defaults.
+    model._internal_config = art.dev.InternalModelConfig(
+        init_args=art.dev.InitArgs(
+            max_seq_length=2048,
+        ),
+        engine_args=art.dev.EngineArgs(
+            enforce_eager=True,
+            gpu_memory_utilization=0.6,
+        ),
+    )
+
+    # Initialize the server
+    backend = LocalBackend(
+        # Normally we don't want to run the server in-process, but for the output
+        # to show up properly on Google Colab we'll enable this.
+        #in_process=True,
+        path="./.art",
+    )
+
+    # Register the model with the local Backend (sets up logging, inference, and training)
+    await model.register(backend)
+
+
+    ### Rollout Definition ###
+
+
+    if os.getenv("WANDB_API_KEY", ""):
+        weave.init(model.project, settings={"print_call_link": False})
+
+    ### Training loop ###
+
+
+    training_config = {
+        "groups_per_step": 2,
+        "num_epochs": 20,
+        "rollouts_per_group": 4,
+        "learning_rate": 1e-5,
+        "max_steps": 20,
+    }
+
+    # Use iterate_dataset with real training scenarios (similar to train.py)
+    training_iterator = iterate_dataset(
+        training_scenarios,  # Use real scenarios from Hugging Face
+        groups_per_step=training_config["groups_per_step"],
+        num_epochs=training_config["num_epochs"],
+        initial_step=await model.get_step(),
+    )
+
+    for batch, step, epoch, epoch_step in training_iterator:
+        print(
+            f"Training step {step}, epoch {epoch}, epoch step {epoch_step}"
+        )
+        print(f"Batch contains {len(batch)} scenarios")
+
+        # Create trajectory groups for this batch (similar to train.py)
+        groups = []
+        for scenario in batch:
+            groups.append(
+                art.TrajectoryGroup(
+                    (
+                        rollout(model, EmailScenario(step=step, scenario=scenario))
+                        for _ in range(training_config["rollouts_per_group"])
+                    )
+                )
+            )
+
+        # Gather all trajectory groups
+        finished_groups = art.gather_trajectory_groups(
+            groups,
+            pbar_desc="gather",
+            max_exceptions=training_config["rollouts_per_group"] * len(batch),
+        )
+
+        judged_groups = []
+        for group in finished_groups:
+            # Use RULER to assign relative scores to each trajectory
+            judged_group = ruler_score_group(group, "openai/o4-mini", debug=True)
+            judged_groups.append(judged_group)
+
+        await model.delete_checkpoints()
+        await model.train(
+            judged_groups,
+            config=art.TrainConfig(learning_rate=training_config["learning_rate"]),
+            # Lowering the logprob_calculation_chunk_size is a memory saving measure
+            # to allow longer sequences (up to 8192 tokens) to be processed on a T4.
+            _config={"logprob_calculation_chunk_size": 8},
+        )
+
+        print(f"Completed training step {step}")
+
+        # Stop after max_steps for demo purposes (adjust as needed)
+        if step >= training_config["max_steps"]:
+            break
+
+if __name__ == "__main__":
+    asyncio.run(main())
