@@ -212,7 +212,6 @@ async def rollout(model: art.Model, math_scenario: MathScenario) -> ProjectTraje
     tools = [run_python_code, return_final_answer]
     tools_by_name = {t.__name__: t for t in tools}
     traj.tools = [convert_to_openai_tool(t) for t in tools]
-    print(traj.tools)
 
     if model.trainable:
         litellm_model_name = f"hosted_vllm/{model.name}"
