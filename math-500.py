@@ -23,6 +23,8 @@ from art.utils.litellm import convert_litellm_choice_to_openai
 from art.local import LocalBackend
 # Training configuration
 from art.utils import iterate_dataset
+from art.rewards import ruler_score_group
+
 
 random.seed(42)
 
@@ -353,7 +355,7 @@ async def main():
             )
 
         # Gather all trajectory groups
-        finished_groups = art.gather_trajectory_groups(
+        finished_groups = await art.gather_trajectory_groups(
             groups,
             pbar_desc="gather",
             max_exceptions=training_config["rollouts_per_group"] * len(batch),
@@ -362,7 +364,7 @@ async def main():
         judged_groups = []
         for group in finished_groups:
             # Use RULER to assign relative scores to each trajectory
-            judged_group = ruler_score_group(group, "openai/o4-mini", debug=True)
+            judged_group = await ruler_score_group(group, "openai/o4-mini", debug=True)
             judged_groups.append(judged_group)
 
         await model.delete_checkpoints()
