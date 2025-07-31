@@ -46,7 +46,9 @@ def return_final_answer(
     return FinalAnswer(answer=answer, source_ids=reference_message_ids)
 
 
-def run_python(code: str) -> str:
+# To create custom tool functions  https://platform.openai.com/docs/api-reference/chat/create#chat-create-tools
+
+def run_python_code(code: str) -> str:
     """
     Executes a string of Python code safely and returns the output.
     The code can use numpy, which is imported as np.
@@ -140,7 +142,7 @@ async def judge_correctness(
         {
             "role": "user",
             "content": (
-                f"Question: {scenario.question}\n"
+                f"Question: {scenario.problem}\n"
                 f"Reference answer: {scenario.answer}\n"
                 f"AI answer: {answer}"
             ),
@@ -168,47 +170,38 @@ class ProjectTrajectory(art.Trajectory):
     final_answer: FinalAnswer | None = None
 
 
-class EmailScenario(BaseModel):
+class MathScenario(BaseModel):
     step: int
     scenario: Scenario
 
 
 @weave.op
-async def rollout(model: art.Model, email_scenario: EmailScenario) -> ProjectTrajectory:
-    scenario = email_scenario.scenario
+async def rollout(model: art.Model, math_scenario: MathScenario) -> ProjectTrajectory:
+    scenario = math_scenario.scenario
 
     traj = ProjectTrajectory(
         reward=0.0,
         messages_and_choices=[],
         metadata={
-            "scenario_id": scenario.id,
-            "step": email_scenario.step,
+            "scenario_id": scenario.unique_id,
+            "step": math_scenario.step,
         },
     )
 
     system_prompt = dedent(
         f"""
-        You are an email search agent. You are given a user query and a list of tools you can use to search the user's email. Use the tools to search the user's emails and find the answer to the user's query. You may take up to {MAX_TURNS} turns to find the answer, so if your first search doesn't find the answer, you can try with different keywords.
-
-        User's email address is {scenario.inbox_address}
-        Today's date is {scenario.query_date}
+        You are a Math Coding Agent.
+        Your role is to solve math problems by leveraging available computational tools. 
+        You may take up to {MAX_TURNS} turns to explore, compute, and verify your answer.
+        Use code and logical reasoning to arrive at a correct and well-supported solution.
+        Choose tools strategically, and ensure your final output is clear, complete, and correct.
         """
     )
 
     traj.messages_and_choices = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": scenario.question},
+        {"role": "user", "content": scenario.problem},
     ]
-
-    def search_inbox(keywords: list[str]) -> list[dict]:
-        """Search the inbox for emails matching the given keywords and return
-        a list of dictionaries so the LLM can easily consume them."""
-        results = search_emails(
-            inbox=scenario.inbox_address,
-            keywords=keywords,
-            sent_before=scenario.query_date,
-        )
-        return [asdict(result) for result in results]
 
     def return_final_answer(
         answer: str, reference_message_ids: list[str]
@@ -216,9 +209,10 @@ async def rollout(model: art.Model, email_scenario: EmailScenario) -> ProjectTra
         """Return the final answer and the message IDs of the emails that were used to generate the answer."""
         return FinalAnswer(answer=answer, source_ids=reference_message_ids)
 
-    tools = [search_inbox, read_email, return_final_answer]
+    tools = [run_python_code, return_final_answer]
     tools_by_name = {t.__name__: t for t in tools}
     traj.tools = [convert_to_openai_tool(t) for t in tools]
+    print(traj.tools)
 
     if model.trainable:
         litellm_model_name = f"hosted_vllm/{model.name}"
@@ -348,7 +342,7 @@ async def main():
             groups.append(
                 art.TrajectoryGroup(
                     (
-                        rollout(model, EmailScenario(step=step, scenario=scenario))
+                        rollout(model, MathScenario(step=step, scenario=scenario))
                         for _ in range(training_config["rollouts_per_group"])
                     )
                 )
