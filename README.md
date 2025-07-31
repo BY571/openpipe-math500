@@ -31,3 +31,11 @@ uv pip install openpipe-art==0.3.11.post2 langchain-core tenacity datasets "gql<
 uv pip install wandb openai
 
 ```
+
+## API-KEYs
+To run the experiment create a `.env` file in the root directory of the project and add the following variables:
+
+```bash
+OPENAI_API_KEY=your_openai_api_key
+WANDB_API_KEY=your_wandb_api_key
+```
