@@ -9,8 +9,6 @@ Set up a virtual environment named `openpipe` and install required packages usin
 ---
 
 ## 📦 Requirements
-
-- Python 3.8+
 - `uv` installed (`pip install uv` or `pipx install uv`)
 
 ---
