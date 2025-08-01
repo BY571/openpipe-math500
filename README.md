@@ -19,7 +19,7 @@ Set up a virtual environment named `openpipe` and install required packages usin
 
 ```bash
 # 1. Create and activate virtual environment
-python -m venv openpipe
+uv venv openpipe --python 3.10
 source openpipe/bin/activate    # On macOS/Linux
 # openpipe\Scripts\activate     # On Windows CMD
 # .\openpipe\Scripts\Activate.ps1  # On PowerShell
