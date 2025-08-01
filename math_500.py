@@ -195,6 +195,9 @@ async def rollout(model: art.Model, math_scenario: MathScenario) -> ProjectTraje
         You may take up to {MAX_TURNS} turns to explore, compute, and verify your answer.
         Use code and logical reasoning to arrive at a correct and well-supported solution.
         Choose tools strategically, and ensure your final output is clear, complete, and correct.
+        
+        Important: When using Python code for math calculations, you MUST use numpy (imported as 'np')
+        and no other external libraries. All mathematical operations should be performed using numpy functions.
         """
     )
 
@@ -278,7 +281,7 @@ async def main():
     model = art.TrainableModel(
         name="math-500-agent-001",
         project="math-500-agent",
-        base_model="Qwen/Qwen2.5-1.5B-Instruct",
+        base_model="unsloth/Qwen2.5-7B-Instruct-unsloth-bnb-4bit",
     )
 
     # To run on a T4, we need to override some config defaults.
