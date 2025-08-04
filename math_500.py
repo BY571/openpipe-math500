@@ -230,6 +230,7 @@ async def rollout(model: art.Model, math_scenario: MathScenario) -> ProjectTraje
             messages=traj.messages(),
             caching=False,
             tools=traj.tools,
+            max_completion_tokens=1024,
         )
 
         response_message = response.choices[0].message
@@ -244,29 +245,83 @@ async def rollout(model: art.Model, math_scenario: MathScenario) -> ProjectTraje
             for tool_call in response_message.tool_calls:
                 tool_name: str = tool_call.function.name
                 if tool_name in tools_by_name:
-                    tool_args = json.loads(tool_call.function.arguments)
-                    tool_to_call = tools_by_name[tool_name]
-                    result = tool_to_call(**tool_args)
-                    traj.messages_and_choices.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_name,
-                            "content": str(result),
-                        }
-                    )
+                    try:
+                        # Parse the arguments
+                        raw_args = tool_call.function.arguments
+                        if isinstance(raw_args, str):
+                            tool_args = json.loads(raw_args)
+                        else:
+                            tool_args = raw_args
+                        
+                        # Ensure tool_args is a dictionary
+                        if not isinstance(tool_args, dict):
+                            print(f"Tool args is not a dict: {type(tool_args)}, value: {tool_args}")
+                            # Skip this tool call
+                            continue
+                        
+                        tool_to_call = tools_by_name[tool_name]
+                        
+                        # Special handling for run_python_code which expects a 'code' parameter
+                        if tool_name == "run_python_code":
+                            if "code" in tool_args:
+                                result = tool_to_call(tool_args["code"])
+                            else:
+                                # If the model passed the code directly as a string
+                                # or in a different format, try to extract it
+                                if len(tool_args) == 1:
+                                    # Single argument, use its value
+                                    result = tool_to_call(list(tool_args.values())[0])
+                                else:
+                                    raise ValueError(f"Expected 'code' parameter for run_python_code, got: {tool_args}")
+                        else:
+                            # For other tools, use the args as-is
+                            result = tool_to_call(**tool_args)
+                        
+                        traj.messages_and_choices.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": tool_name,
+                                "content": str(result),
+                            }
+                        )
 
-                    if tool_name == "return_final_answer":
-                        traj.final_answer = result
-                        # Score the trajectory
-                        if traj.final_answer:
-                            correctness_judge_response = await judge_correctness(
-                                scenario, traj.final_answer.answer
-                            )
-                            traj.metrics["correct"] = float(
-                                correctness_judge_response.accept
-                            )
-                        return traj
+                        if tool_name == "return_final_answer":
+                            traj.final_answer = result
+                            # Score the trajectory
+                            if traj.final_answer:
+                                correctness_judge_response = await judge_correctness(
+                                    scenario, traj.final_answer.answer
+                                )
+                                traj.metrics["correct"] = float(
+                                    correctness_judge_response.accept
+                                )
+                            return traj
+                    
+                    except json.JSONDecodeError as e:
+                        print(f"JSON decode error for tool {tool_name}: {e}")
+                        print(f"Raw arguments: {tool_call.function.arguments}")
+                        # Add error message to trajectory
+                        traj.messages_and_choices.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": tool_name,
+                                "content": f"Error: Invalid JSON in tool arguments: {e}",
+                            }
+                        )
+                    except Exception as e:
+                        print(f"Error executing tool {tool_name}: {e}")
+                        print(f"Tool args: {tool_args}")
+                        # Add error message to trajectory
+                        traj.messages_and_choices.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": tool_name,
+                                "content": f"Error executing tool: {str(e)}",
+                            }
+                        )
         except Exception as e:
             print(f"Error parsing tool calls: {e}")
             return traj
@@ -279,7 +334,7 @@ async def main():
 
     # Declare the model
     model = art.TrainableModel(
-        name="math-500-agent-001",
+        name=f"math-500-agent-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         project="math-500-agent",
         base_model="unsloth/Qwen2.5-7B-Instruct-unsloth-bnb-4bit",
     )
